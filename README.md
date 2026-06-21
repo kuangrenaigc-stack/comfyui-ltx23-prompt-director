@@ -3,8 +3,7 @@
 A ComfyUI custom node that generates LTX-2.3 cinematic prompt JSON from a
 **single reference image** and scene description.  It faithfully reproduces the
 prompt protocol from the original `ltx-2.3-cinematic-director` application and
-calls **Gemini 3.1 Pro** through the **Yunwu Gemini native generateContent
-HTTP API**.
+calls the **official Gemini Developer API** (`generativelanguage.googleapis.com`).
 
 ## Features
 
@@ -25,6 +24,14 @@ HTTP API**.
 - API key is configurable via node input, environment variables, or
   `config.json` — never hardcoded.
 
+### Bonus: Gemini Official Model List node
+
+A second utility node **GeminiOfficialModelList** is included.  It calls
+`GET /v1beta/models` with your API key and returns a list of models that
+support `generateContent`, one per line (with the `models/` prefix stripped).
+Use it to browse available models and copy the desired name into the
+Prompt Director node — one key for both discovery and generation.
+
 ## Installation
 
 1. Copy this entire folder into your ComfyUI `custom_nodes` directory:
@@ -35,7 +42,7 @@ HTTP API**.
        comfyui-ltx23-prompt-director/
          __init__.py
          nodes.py
-         yunwu_client.py
+         gemini_client.py
          prompt_templates.py
          config.example.json
          requirements.txt
@@ -56,44 +63,55 @@ HTTP API**.
 
 ## Configuration
 
-You must provide a Yunwu API key.  Choose one method (in order of precedence):
+You must provide a **Gemini API key**.  Get one from
+[Google AI Studio](https://aistudio.google.com/apikey).
+
+Choose one method (in order of precedence):
 
 ### A. Node input (per-workflow)
 Set the `api_key` string input on the node directly.
 
 ### B. Environment variable
 ```bash
-export YUNWU_API_KEY="***"
-export YUNWU_BASE_URL="https://yunwu.ai"      # optional
-export YUNWU_MODEL="gemini-3.1-pro-preview"    # optional
+export GOOGLE_API_KEY="your-key-here"
+# (GOOGLE_API_KEY takes precedence when both are set)
+# or
+export GEMINI_API_KEY="your-key-here"
+
+export GEMINI_MODEL="gemini-3.1-pro-preview"    # optional, override model name
 ```
 
 ### C. config.json
 Copy `config.example.json` to `config.json` and fill in your key:
 ```json
 {
-    "api_key": "***",
+    "api_key": "your-key-here",
     "base_url": "",
     "model": "gemini-3.1-pro-preview"
 }
 ```
 
+> **base_url is optional.**  Leave it empty and the official
+> `https://generativelanguage.googleapis.com` endpoint is used automatically.
+> Only set it if you need to route through a proxy or custom endpoint.
+
 ## API Transport
 
-This plugin calls the **Gemini native generateContent REST endpoint**:
+This plugin calls the **official Gemini Developer API generateContent REST endpoint**:
 
 ```
-POST https://yunwu.ai/v1beta/models/gemini-3.1-pro-preview:generateContent
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro-preview:generateContent
 ```
 
-- **Headers:** `x-goog-api-key: <your-yunwu-key>`, `Content-Type: application/json`
+- **Headers:** `x-goog-api-key: <your-gemini-key>`, `Content-Type: application/json`
 - **Payload:** Gemini `contents` / `systemInstruction` / `generationConfig` format
 - **Structured output:** Sends `responseSchema` + `responseMimeType: "application/json"`
 
-The `base_url` config value should be `https://yunwu.ai` (or your custom
-endpoint).  The `/v1beta/models/{model}:generateContent` path is appended
-automatically unless the base URL already includes `/v1beta` or the full
-`:generateContent` suffix.
+The model list node calls:
+
+```
+GET https://generativelanguage.googleapis.com/v1beta/models
+```
 
 ## Node Usage
 
@@ -106,32 +124,50 @@ automatically unless the base URL already includes `/v1beta` or the full
 | `image` | IMAGE | *required* | Reference first frame |
 | `scene_description` | STRING (multiline) | *required* | Describe the scene |
 | `duration` | INT | 5 (min 4, max 10) | Target video duration in seconds |
-| `base_url` | STRING | *empty* | (Advanced) Optional override; leave empty for Yunwu |
-| `api_key` | STRING | *empty* | Yunwu API key (optional — env/config recommended) |
+| `base_url` | STRING | *empty* | (Advanced) Override API endpoint — leave empty for official |
+| `api_key` | STRING | *empty* | Gemini API key (optional — env/config recommended) |
 | `model` | STRING | `gemini-3.1-pro-preview` | Model name |
 | `temperature` | FLOAT | 0.7 (0–1.5) | Generation temperature |
 
-**Base URL is an advanced compatibility override** — it exists only to preserve widget positional compatibility with older saved workflows. You do NOT need to fill it in. For normal use, leave it empty and the node automatically resolves `https://yunwu.ai` via its internal default. If you are using a non-default or self-hosted Yunwu endpoint, configure `base_url` in `config.json` or via the `YUNWU_BASE_URL` environment variable instead.
-
-> **Compatibility note:** The `base_url` widget was re-introduced in positional order (before `api_key`) so that workflows saved before its removal continue to load correctly. The node also includes defensive guards against corrupted widget values (e.g. a model name accidentally fed as temperature) that could occur when loading workflows saved during the transitional period.
+**Base URL is an advanced compatibility override** — it exists only to preserve
+widget positional compatibility with older saved workflows. You do NOT need to
+fill it in. For normal use, leave it empty and the node automatically uses
+`https://generativelanguage.googleapis.com`. If you are using a proxy, configure
+`base_url` in `config.json` instead.
 
 | Output | Type | Description |
 |--------|------|-------------|
-| `ltx_model_prompt` | STRING | **Main output — wire this to LTX2.3.** Contains the complete JSON prompt engineering (pretty-printed) followed by two newlines and the `final_cinematic_prompt` pure text. This is the single string the LTX model needs. |
-| `complete_prompt_json` | STRING | **Preview/debug.** Full JSON prompt engineering (all four fields — `camera_and_reveal_map`, `action_choreography_plan`, `continuity_database`, `final_cinematic_prompt`) serialized as pretty-printed JSON. |
-| `final_cinematic_prompt` | STRING | **Preview/debug.** Extracted `final_cinematic_prompt` field. Starts with `[SYSTEM: Visuals contain NO on-screen text.]`. |
+| `ltx_model_prompt` | STRING | **Main output — wire this to LTX2.3.** Contains the complete JSON prompt engineering (pretty-printed) followed by two newlines and the `final_cinematic_prompt` pure text. |
+| `complete_prompt_json` | STRING | **Preview/debug.** Full JSON prompt engineering (all four fields) serialized as pretty-printed JSON. |
+| `final_cinematic_prompt` | STRING | **Preview/debug.** Extracted `final_cinematic_prompt` field. |
 | `camera_and_reveal_map` | STRING | **Preview/debug.** Camera move definition and revealed-content map |
-| `action_choreography_plan` | STRING | **Preview/debug.** Action choreography with timeblocks and micro-expressions |
+| `action_choreography_plan` | STRING | **Preview/debug.** Action choreography with timeblocks |
 | `continuity_database` | STRING | **Preview/debug.** Visual Archetypes and Voice Profiles tracker |
+
+### Node: Gemini Official Model List
+
+**Category:** `LTX2.3/Prompt`
+
+| Input | Type | Default | Description |
+|-------|------|---------|-------------|
+| `api_key` | STRING | *empty* | Gemini API key (env/config recommended) |
+| `base_url` | STRING | *empty* | (Advanced) Override base URL for models endpoint |
+
+| Output | Type | Description |
+|--------|------|-------------|
+| `model_list` | STRING | Available models supporting `generateContent`, one per line |
 
 ### Wiring to LTX2.3
 
-Connect **`ltx_model_prompt`** → LTX2.3 prompt input.  This is the single output that delivers both the complete JSON prompt engineering AND the final cinematic prompt together — exactly what the LTX model needs.  The `complete_prompt_json`, `final_cinematic_prompt`, `camera_and_reveal_map`, `action_choreography_plan`, and `continuity_database` outputs are provided as separate preview/debug channels and are NOT needed for generation — they exist for inspection and optional conditioning.
+Connect **`ltx_model_prompt`** → LTX2.3 prompt input.  This is the single output
+that delivers both the complete JSON prompt engineering AND the final cinematic
+prompt together — exactly what the LTX model needs.
 
 ## Troubleshooting
 
 - **"API key is required"** — set the key via one of the three config methods.
-- **"HTTP request to Yunwu failed"** — verify network connectivity. If you are using a non-default Yunwu endpoint, set `YUNWU_BASE_URL` or the `base_url` key in `config.json`.
+- **"HTTP request to Gemini API failed"** — verify network connectivity and
+  that your API key is valid.  If using a proxy, check your `base_url` setting.
 - **"JSON PARSE ERROR"** in `ltx_model_prompt` — the model returned
   non-JSON output.  The raw text is available in `ltx_model_prompt`,
   `complete_prompt_json`, and `final_cinematic_prompt`.  Check the model

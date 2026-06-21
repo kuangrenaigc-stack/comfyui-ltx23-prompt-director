@@ -1,9 +1,8 @@
 """
-Yunwu API client — Gemini native generateContent HTTP interface.
+Gemini official API client — calls the Gemini Developer API generateContent HTTP endpoint.
 
-Calls POST {base_url}/v1beta/models/{model}:generateContent with
-Gemini-native REST payload.  Uses x-goog-api-key header (no Authorization
-Bearer).  No Google SDK / @google/genai dependency.
+Uses POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+with x-goog-api-key header.  No Google SDK / @google/genai dependency.
 """
 
 from __future__ import annotations
@@ -15,17 +14,16 @@ from typing import Any, Dict, Optional
 
 import requests
 
-# Default fallback: documented as a known Yunwu endpoint pattern, not an
-# assertion that it is live or guaranteed.  Users SHOULD set their own.
-_DEFAULT_YUNWU_BASE_URL = "https://yunwu.ai"
+# Default to the official Gemini Developer API endpoint.
+_DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 
 # Hard limit in seconds for a single API call so the ComfyUI node does not
 # hang indefinitely.
 _REQUEST_TIMEOUT = 120
 
 
-class YunwuClientError(Exception):
-    """Raised when the Yunwu API returns an error or is unreachable."""
+class GeminiClientError(Exception):
+    """Raised when the Gemini API returns an error or is unreachable."""
 
 
 def _load_config_json(config_path: str) -> Dict[str, Any]:
@@ -40,39 +38,41 @@ def resolve_base_url(node_input: str = "") -> str:
     """
     Resolve base_url with this precedence:
       1. non-empty node input
-      2. env YUNWU_BASE_URL
-      3. plugin config.json (base_url key)
-      4. documented fallback placeholder (_DEFAULT_YUNWU_BASE_URL)
+      2. plugin config.json (base_url key)
+      3. documented fallback (_DEFAULT_GEMINI_BASE_URL)
+
+    There is NO dedicated base_url environment variable by design —
+    the official endpoint is always the default.  Only advanced users
+    who need a proxy or override should set base_url in config.json
+    or via the node input.
     """
     if node_input and node_input.strip():
         return node_input.strip().rstrip("/")
-
-    env_val = os.environ.get("YUNWU_BASE_URL", "").strip()
-    if env_val:
-        return env_val.rstrip("/")
 
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     config = _load_config_json(os.path.join(plugin_dir, "config.json"))
     if config.get("base_url", "").strip():
         return config["base_url"].strip().rstrip("/")
 
-    return _DEFAULT_YUNWU_BASE_URL
+    return _DEFAULT_GEMINI_BASE_URL
 
 
 def resolve_api_key(node_input: str = "") -> str:
     """
     Resolve api_key with this precedence:
       1. non-empty node input
-      2. env YUNWU_API_KEY
-      3. plugin config.json (api_key key)
+      2. env GOOGLE_API_KEY           (official docs: GOOGLE_API_KEY takes precedence)
+      3. env GEMINI_API_KEY
+      4. plugin config.json (api_key key)
     Returns "" if nothing is found.
     """
     if node_input and node_input.strip():
         return node_input.strip()
 
-    env_val = os.environ.get("YUNWU_API_KEY", "").strip()
-    if env_val:
-        return env_val
+    for env_var in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        env_val = os.environ.get(env_var, "").strip()
+        if env_val:
+            return env_val
 
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     config = _load_config_json(os.path.join(plugin_dir, "config.json"))
@@ -80,11 +80,11 @@ def resolve_api_key(node_input: str = "") -> str:
 
 
 def resolve_model(node_input: str = "") -> str:
-    """Resolve model with precedence: node input > env YUNWU_MODEL > config > default."""
+    """Resolve model with precedence: node input > env GEMINI_MODEL > config > default."""
     if node_input and node_input.strip():
         return node_input.strip()
 
-    env_val = os.environ.get("YUNWU_MODEL", "").strip()
+    env_val = os.environ.get("GEMINI_MODEL", "").strip()
     if env_val:
         return env_val
 
@@ -132,7 +132,7 @@ def _build_generate_content_endpoint(base_url: str, model: str) -> str:
     return f"{url}/v1beta/models/{model}:generateContent"
 
 
-def call_yunwu(
+def call_gemini(
     *,
     base_url: str,
     api_key: str,
@@ -144,7 +144,7 @@ def call_yunwu(
     response_schema: Dict[str, Any],
 ) -> Dict[str, str]:
     """
-    Send a multimodal request to the Yunwu Gemini generateContent endpoint.
+    Send a multimodal request to the official Gemini generateContent endpoint.
 
     Returns a dict with keys:
         ltx_model_prompt       (complete_prompt_json + two newlines + final_cinematic_prompt;
@@ -155,7 +155,7 @@ def call_yunwu(
         action_choreography_plan
         continuity_database
 
-    Raises YunwuClientError on failure.
+    Raises GeminiClientError on failure.
     """
 
     # Build endpoint URL
@@ -196,13 +196,13 @@ def call_yunwu(
         },
     }
 
-    # Some proxies may reject responseSchema; try once with, once without.
+    # Some endpoints may reject responseSchema; try once with, once without.
     raw_text: Optional[str] = None
 
     for attempt in range(2):
         if attempt == 1:
             # Retry without responseSchema / responseMimeType to handle
-            # strict proxies that don't support structured output yet.
+            # endpoints that don't support structured output yet.
             payload["generationConfig"].pop("responseSchema", None)
             payload["generationConfig"].pop("responseMimeType", None)
 
@@ -214,8 +214,8 @@ def call_yunwu(
                 timeout=_REQUEST_TIMEOUT,
             )
         except requests.RequestException as exc:
-            raise YunwuClientError(
-                f"HTTP request to Yunwu failed: {exc}"
+            raise GeminiClientError(
+                f"HTTP request to Gemini API failed: {exc}"
             ) from exc
 
         if resp.status_code == 200:
@@ -223,7 +223,7 @@ def call_yunwu(
             # Gemini REST response: candidates[0].content.parts[*].text
             candidates = body.get("candidates", [])
             if not candidates:
-                raise YunwuClientError(
+                raise GeminiClientError(
                     f"API returned empty candidates list. "
                     f"Response snippet: {json.dumps(body)[:500]}"
                 )
@@ -236,7 +236,7 @@ def call_yunwu(
             ]
             raw_text = "\n".join(text_parts)
             if not raw_text:
-                raise YunwuClientError(
+                raise GeminiClientError(
                     f"API returned empty text from parts. "
                     f"Response snippet: {json.dumps(body)[:500]}"
                 )
@@ -247,12 +247,12 @@ def call_yunwu(
             continue
 
         # Any other error — raise
-        raise YunwuClientError(
-            f"Yunwu API error {resp.status_code}: {resp.text[:1000]}"
+        raise GeminiClientError(
+            f"Gemini API error {resp.status_code}: {resp.text[:1000]}"
         )
 
     if raw_text is None:
-        raise YunwuClientError("Failed to get a valid response from Yunwu API")
+        raise GeminiClientError("Failed to get a valid response from Gemini API")
 
     # Parse JSON output
     try:

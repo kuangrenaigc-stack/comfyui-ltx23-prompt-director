@@ -2,9 +2,10 @@
 ComfyUI custom node: LTX2.3 Cinematic Prompt Director (Single Image).
 
 Converts a ComfyUI IMAGE tensor to a raw base64 PNG, sends it
-together with a scene description and duration to the Yunwu
-Gemini generateContent API, and returns the four-field
-cinematic prompt JSON plus the final executable prompt string.
+together with a scene description and duration to the official
+Gemini Developer API generateContent endpoint, and returns the
+four-field cinematic prompt JSON plus the final executable prompt
+string.
 """
 
 from __future__ import annotations
@@ -13,17 +14,17 @@ import base64
 import io
 import logging
 import urllib.parse
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
 
-from .yunwu_client import (
-    call_yunwu,
+from .gemini_client import (
+    call_gemini,
     resolve_api_key,
     resolve_base_url,
     resolve_model,
-    YunwuClientError,
+    GeminiClientError,
 )
 from .prompt_templates import (
     SYSTEM_INSTRUCTION,
@@ -135,14 +136,14 @@ def _tensor_to_base64(image_tensor: torch.Tensor) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Node class
+# Node: LTX2.3 Cinematic Prompt Director (Single Image)
 # ---------------------------------------------------------------------------
 
 class LTX23CinematicPromptDirectorSingle:
     """
     ComfyUI node that generates LTX-2.3 cinematic prompt JSON from a single
-    reference image and scene description via the Yunwu Gemini generateContent
-    API.
+    reference image and scene description via the official Gemini
+    generateContent API.
     """
 
     @classmethod
@@ -165,16 +166,16 @@ class LTX23CinematicPromptDirectorSingle:
             "optional": {
                 "base_url": ("STRING", {
                     "default": "",
-                    "placeholder": "Optional override; leave empty for Yunwu",
+                    "placeholder": "Advanced: override Gemini API endpoint",
                     "advanced": True,
                 }),
                 "api_key": ("STRING", {
                     "default": "",
-                    "placeholder": "Leave empty to use env / config.json",
+                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
                 }),
                 "model": ("STRING", {
                     "default": "gemini-3.1-pro-preview",
-                    "placeholder": "Model name for Yunwu API",
+                    "placeholder": "Model name (e.g. gemini-3.1-pro-preview, gemini-2.5-flash)",
                 }),
                 "temperature": ("FLOAT", {
                     "default": 0.7,
@@ -221,7 +222,7 @@ class LTX23CinematicPromptDirectorSingle:
         if not resolved_api_key:
             raise ValueError(
                 "API key is required. Set it via node input, "
-                "YUNWU_API_KEY environment variable, or config.json."
+                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
             )
 
         # Sanitize base_url: if a corrupted non-URL value leaked in from an
@@ -253,9 +254,9 @@ class LTX23CinematicPromptDirectorSingle:
         # --- Build system instruction (includes textual schema directive) ------
         system_instruction = SYSTEM_INSTRUCTION + build_schema_directive()
 
-        # --- Call Yunwu API ---------------------------------------------------
+        # --- Call Gemini API -------------------------------------------------
         try:
-            result = call_yunwu(
+            result = call_gemini(
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
                 model=resolved_model,
@@ -265,9 +266,9 @@ class LTX23CinematicPromptDirectorSingle:
                 temperature=safe_temp,
                 response_schema=RESPONSE_SCHEMA,
             )
-        except YunwuClientError as exc:
+        except GeminiClientError as exc:
             raise RuntimeError(
-                f"Yunwu API call failed: {exc}"
+                f"Gemini API call failed: {exc}"
             ) from exc
 
         # --- Diagnostic logging: post-API results -----------------------------
@@ -312,12 +313,133 @@ class LTX23CinematicPromptDirectorSingle:
 
 
 # ---------------------------------------------------------------------------
+# Node: Gemini Official Model List
+# ---------------------------------------------------------------------------
+
+class GeminiOfficialModelList:
+    """
+    Utility node that fetches available Gemini models from the official API.
+
+    Calls GET /v1beta/models with the provided API key and returns models
+    that support the generateContent method, one per line.  The "models/"
+    prefix is stripped if present.
+
+    Use this with a single Gemini API key to browse available models,
+    then copy the desired model name into the Prompt Director node.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {},
+            "optional": {
+                "api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
+                }),
+                "base_url": ("STRING", {
+                    "default": "",
+                    "placeholder": "Advanced: override base URL for models list",
+                    "advanced": True,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("model_list",)
+
+    FUNCTION = "list_models"
+    CATEGORY = "LTX2.3/Prompt"
+    OUTPUT_NODE = True
+
+    def list_models(
+        self,
+        api_key: str = "",
+        base_url: str = "",
+    ) -> Tuple[str,]:
+        # --- Resolve API key --------------------------------------------------
+        resolved_api_key = resolve_api_key(api_key)
+        if not resolved_api_key:
+            raise ValueError(
+                "API key is required to list models. Set it via node input, "
+                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
+            )
+
+        # --- Resolve base URL -------------------------------------------------
+        # For models list we need just the base, not the generateContent endpoint.
+        if base_url and base_url.strip():
+            base = base_url.strip().rstrip("/")
+        else:
+            base = resolve_base_url("")
+
+        # --- Call GET /v1beta/models with pagination ----------------------
+        import requests
+
+        endpoint = f"{base}/v1beta/models"
+        headers = {"x-goog-api-key": resolved_api_key}
+
+        filtered: List[str] = []
+        page_token: Optional[str] = None
+
+        while True:
+            params: Dict[str, Any] = {"pageSize": 1000}
+            if page_token:
+                params["pageToken"] = page_token
+
+            try:
+                resp = requests.get(
+                    endpoint,
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Failed to fetch model list from Gemini API: {exc}"
+                ) from exc
+
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"Gemini API models list error {resp.status_code}: {resp.text[:1000]}"
+                )
+
+            body = resp.json()
+            models: List[Dict[str, Any]] = body.get("models", [])
+
+            for m in models:
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" not in methods:
+                    continue
+                name = m.get("name", "")
+                if name.startswith("models/"):
+                    name = name[len("models/"):]
+                if name:
+                    filtered.append(name)
+
+            # Follow pageToken until exhausted
+            page_token = body.get("nextPageToken")
+            if not page_token:
+                break
+
+        model_list = "\n".join(sorted(filtered))
+
+        logger.info(
+            "GeminiOfficialModelList: found %d models supporting generateContent",
+            len(filtered),
+        )
+
+        return (model_list,)
+
+
+# ---------------------------------------------------------------------------
 # Node registration for ComfyUI
 # ---------------------------------------------------------------------------
 NODE_CLASS_MAPPINGS = {
     "LTX23CinematicPromptDirectorSingle": LTX23CinematicPromptDirectorSingle,
+    "GeminiOfficialModelList": GeminiOfficialModelList,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX23CinematicPromptDirectorSingle": "LTX2.3 Cinematic Prompt Director (Single Image)",
+    "GeminiOfficialModelList": "Gemini Official Model List",
 }
