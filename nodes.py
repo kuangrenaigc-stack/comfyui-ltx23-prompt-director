@@ -2,10 +2,9 @@
 ComfyUI custom node: LTX2.3 Cinematic Prompt Director (Single Image).
 
 Converts a ComfyUI IMAGE tensor to a raw base64 PNG, sends it
-together with a scene description and duration to the official
-Gemini Developer API generateContent endpoint, and returns the
-four-field cinematic prompt JSON plus the final executable prompt
-string.
+together with a scene description and duration to the Yunwu
+Gemini-native generateContent endpoint, and returns the four-field
+cinematic prompt JSON plus the final executable prompt string.
 """
 
 from __future__ import annotations
@@ -24,6 +23,9 @@ from .gemini_client import (
     resolve_api_key,
     resolve_base_url,
     resolve_model,
+    fetch_models_list,
+    filter_gemini_models,
+    _sanitize_error_text,
     GeminiClientError,
 )
 from .prompt_templates import (
@@ -142,7 +144,7 @@ def _tensor_to_base64(image_tensor: torch.Tensor) -> str:
 class LTX23CinematicPromptDirectorSingle:
     """
     ComfyUI node that generates LTX-2.3 cinematic prompt JSON from a single
-    reference image and scene description via the official Gemini
+    reference image and scene description via the Yunwu Gemini-native
     generateContent API.
     """
 
@@ -166,12 +168,12 @@ class LTX23CinematicPromptDirectorSingle:
             "optional": {
                 "base_url": ("STRING", {
                     "default": "",
-                    "placeholder": "Advanced: override Gemini API endpoint",
+                    "placeholder": "Advanced: override base URL (default: https://yunwu.ai)",
                     "advanced": True,
                 }),
                 "api_key": ("STRING", {
                     "default": "",
-                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
+                    "placeholder": "Yunwu API key (leave empty to use env / config.json)",
                 }),
                 "model": ("STRING", {
                     "default": "gemini-3.1-pro-preview",
@@ -222,7 +224,7 @@ class LTX23CinematicPromptDirectorSingle:
         if not resolved_api_key:
             raise ValueError(
                 "API key is required. Set it via node input, "
-                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
+                "YUNWU_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
             )
 
         # Sanitize base_url: if a corrupted non-URL value leaked in from an
@@ -313,18 +315,16 @@ class LTX23CinematicPromptDirectorSingle:
 
 
 # ---------------------------------------------------------------------------
-# Node: Gemini Official Model List
+# Node: Yunwu Model List
 # ---------------------------------------------------------------------------
 
 class GeminiOfficialModelList:
     """
-    Utility node that fetches available Gemini models from the official API.
+    Utility node that fetches available Gemini models from the Yunwu API.
 
-    Calls GET /v1beta/models with the provided API key and returns models
-    that support the generateContent method, one per line.  The "models/"
-    prefix is stripped if present.
+    Calls GET /v1beta/models with x-goog-api-key and returns model IDs, one per line.
 
-    Use this with a single Gemini API key to browse available models,
+    Use this with a single Yunwu API key to browse available models,
     then copy the desired model name into the Prompt Director node.
     """
 
@@ -335,11 +335,11 @@ class GeminiOfficialModelList:
             "optional": {
                 "api_key": ("STRING", {
                     "default": "",
-                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
+                    "placeholder": "Yunwu API key (leave empty to use env / config.json)",
                 }),
                 "base_url": ("STRING", {
                     "default": "",
-                    "placeholder": "Advanced: override base URL for models list",
+                    "placeholder": "Advanced: override base URL (default: https://yunwu.ai)",
                     "advanced": True,
                 }),
             },
@@ -362,73 +362,124 @@ class GeminiOfficialModelList:
         if not resolved_api_key:
             raise ValueError(
                 "API key is required to list models. Set it via node input, "
-                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
+                "YUNWU_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
             )
 
         # --- Resolve base URL -------------------------------------------------
-        # For models list we need just the base, not the generateContent endpoint.
-        if base_url and base_url.strip():
-            base = base_url.strip().rstrip("/")
-        else:
-            base = resolve_base_url("")
+        resolved_base = base_url.strip() if base_url and base_url.strip() else ""
 
-        # --- Call GET /v1beta/models with pagination ----------------------
-        import requests
+        # --- Fetch models via shared helper -----------------------------------
+        filtered = fetch_models_list(
+            api_key=resolved_api_key,
+            base_url=resolved_base,
+        )
 
-        endpoint = f"{base}/v1beta/models"
-        headers = {"x-goog-api-key": resolved_api_key}
-
-        filtered: List[str] = []
-        page_token: Optional[str] = None
-
-        while True:
-            params: Dict[str, Any] = {"pageSize": 1000}
-            if page_token:
-                params["pageToken"] = page_token
-
-            try:
-                resp = requests.get(
-                    endpoint,
-                    headers=headers,
-                    params=params,
-                    timeout=30,
-                )
-            except requests.RequestException as exc:
-                raise RuntimeError(
-                    f"Failed to fetch model list from Gemini API: {exc}"
-                ) from exc
-
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Gemini API models list error {resp.status_code}: {resp.text[:1000]}"
-                )
-
-            body = resp.json()
-            models: List[Dict[str, Any]] = body.get("models", [])
-
-            for m in models:
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" not in methods:
-                    continue
-                name = m.get("name", "")
-                if name.startswith("models/"):
-                    name = name[len("models/"):]
-                if name:
-                    filtered.append(name)
-
-            # Follow pageToken until exhausted
-            page_token = body.get("nextPageToken")
-            if not page_token:
-                break
-
-        model_list = "\n".join(sorted(filtered))
+        model_list = "\n".join(filtered)
 
         logger.info(
-            "GeminiOfficialModelList: found %d models supporting generateContent",
+            "GeminiOfficialModelList: found %d models",
             len(filtered),
         )
 
         return (model_list,)
+
+
+# ---------------------------------------------------------------------------
+# HTTP route: interactive model list endpoint
+# ---------------------------------------------------------------------------
+# Registers POST /ltx23/gemini/models on ComfyUI's built-in PromptServer
+# so the web JS extension can fetch models interactively.
+# Calls GET /v1beta/models with x-goog-api-key.
+# Falls back gracefully when ComfyUI is not importable (py_compile checks).
+
+_ROUTE_REGISTERED = False
+
+try:
+    from aiohttp import web as aiohttp_web
+    from server import PromptServer  # type: ignore[import-untyped]
+
+    @PromptServer.instance.routes.post("/ltx23/gemini/models")
+    async def _ltx23_gemini_models_route(request: aiohttp_web.Request):
+        """Return filtered Gemini models as JSON: {models: [...]}."""
+        import asyncio as _asyncio
+        import logging as _route_logging
+        _rlog = _route_logging.getLogger(__name__)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return aiohttp_web.json_response(
+                {"error": "Invalid JSON body"}, status=400
+            )
+
+        raw_api_key = (body.get("api_key") or "").strip()
+        raw_base_url = (body.get("base_url") or "").strip()
+
+        # Resolve API key through the standard precedence chain.
+        # NEVER log or return the key.
+        resolved_key = resolve_api_key(raw_api_key)
+        if not resolved_key:
+            return aiohttp_web.json_response(
+                {"error": "API key required — set via node input, env, or config.json"},
+                status=401,
+            )
+
+        # Resolve base URL: pass through resolve_base_url for consistent
+        # precedence (node input > config.json > Yunwu default).
+        # Strip any :generateContent suffix that may have leaked in.
+        resolved_base = resolve_base_url(raw_base_url)
+        if resolved_base.endswith(":generateContent"):
+            resolved_base = resolved_base.rsplit(":", 1)[0]
+
+        # Reuse the existing synchronous helper — no duplicated aiohttp logic.
+        try:
+            filtered = await _asyncio.to_thread(
+                fetch_models_list,
+                api_key=resolved_key,
+                base_url=resolved_base,
+            )
+        except RuntimeError as exc:
+            # Classify error for a friendlier HTTP status.
+            msg = str(exc)
+            status = 502
+            if (
+                "authentication" in msg.lower()
+                or "401" in msg
+                or "403" in msg
+            ):
+                status = 401
+            elif (
+                "network" in msg.lower()
+                or "cannot reach" in msg.lower()
+                or "timeout" in msg.lower()
+            ):
+                status = 502
+            # Sanitise: never echo the raw API key back.
+            safe_msg = _sanitize_error_text(msg, resolved_key)
+            _rlog.error("/ltx23/gemini/models error: %s", safe_msg)
+            return aiohttp_web.json_response(
+                {"error": safe_msg}, status=status
+            )
+        except Exception as exc:
+            _rlog.exception("Unexpected error in /ltx23/gemini/models")
+            return aiohttp_web.json_response(
+                {"error": f"Internal error: {exc}"},
+                status=500,
+            )
+
+        _rlog.info(
+            "/ltx23/gemini/models: returned %d models: %s",
+            len(filtered),
+            ", ".join(filtered),
+        )
+
+        return aiohttp_web.json_response({"models": filtered})
+
+    _ROUTE_REGISTERED = True
+
+except ImportError:
+    # ComfyUI server not available (e.g. py_compile check, standalone test).
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -441,5 +492,5 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX23CinematicPromptDirectorSingle": "LTX2.3 Cinematic Prompt Director (Single Image)",
-    "GeminiOfficialModelList": "Gemini Official Model List",
+    "GeminiOfficialModelList": "Yunwu Model List",
 }
