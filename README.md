@@ -24,7 +24,28 @@ calls the **official Gemini Developer API** (`generativelanguage.googleapis.com`
 - API key is configurable via node input, environment variables, or
   `config.json` — never hardcoded.
 
-### Bonus: Gemini Official Model List node
+### Bonus: Interactive Model Selection (NEW)
+
+The Prompt Director node now has a **built-in model selector** so you don't
+need the separate `GeminiOfficialModelList` node just to pick a model:
+
+1. Paste your Gemini API key into the `api_key` widget on the
+   `LTX23CinematicPromptDirectorSingle` node.
+2. Click the **Refresh Gemini Models** button.
+3. Pick a model from the `available_model` dropdown.
+4. The selected model is automatically written into the `model` text widget.
+
+The existing `model` text widget is preserved — workflows saved before this
+update continue to work.  The default model is `gemini-3.1-pro-preview` as a
+fallback; you are never locked to a single model.
+
+**How it works under the hood:** the button calls `POST /ltx23/gemini/models`
+on ComfyUI's built-in server, which fetches `GET /v1beta/models` from the
+Gemini API with your key, filters to models that support `generateContent`,
+and returns a clean list.  Your API key is sent in the request body and is
+**never logged or returned** in the response.
+
+### Gemini Official Model List node (legacy)
 
 A second utility node **GeminiOfficialModelList** is included.  It calls
 `GET /v1beta/models` with your API key and returns a list of models that
@@ -47,6 +68,8 @@ Prompt Director node — one key for both discovery and generation.
          config.example.json
          requirements.txt
          README.md
+         web/
+           ltx23_model_selector.js
    ```
 
 2. Install Python dependencies (ComfyUI's own Python environment):
@@ -174,6 +197,13 @@ prompt together — exactly what the LTX model needs.
   endpoint and `responseSchema` compatibility.
 - **No ComfyUI imports available** — the plugin gracefully degrades for
   `py_compile` checks outside ComfyUI.
+- **Model refresh button says \"API key required\"** — make sure you filled
+  in the `api_key` widget (or set `GOOGLE_API_KEY` / `GEMINI_API_KEY` env
+  var or `config.json`).  The route uses the same `resolve_api_key` chain
+  as generation.
+- **Model list is empty** — verify your API key is valid at
+  [Google AI Studio](https://aistudio.google.com/apikey).  Also check that
+  `base_url` is empty (unless you're intentionally using a proxy).
 
 ## License
 

@@ -22,8 +22,29 @@ _DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 _REQUEST_TIMEOUT = 120
 
 
+_REDACTED = "***REDACTED***"
+
+# Known-deprecated model names mapped to current equivalents.
+_MODEL_REMAP: dict[str, str] = {
+    "gemini-3-pro-preview": "gemini-3.1-pro-preview",
+}
+
+# Exclude deprecated names from fetched model lists.
+_MODEL_BLOCKLIST: set[str] = {
+    "gemini-3-pro-preview",
+}
+
+
 class GeminiClientError(Exception):
     """Raised when the Gemini API returns an error or is unreachable."""
+
+
+def _sanitize_error_text(text: str, api_key: str) -> str:
+    """Remove the API key from error text so it never leaks into logs or UI."""
+    if not api_key or not text:
+        return text
+    # Redact the literal key string if it appears anywhere.
+    return text.replace(api_key, _REDACTED)
 
 
 def _load_config_json(config_path: str) -> Dict[str, Any]:
@@ -80,20 +101,31 @@ def resolve_api_key(node_input: str = "") -> str:
 
 
 def resolve_model(node_input: str = "") -> str:
-    """Resolve model with precedence: node input > env GEMINI_MODEL > config > default."""
+    """Resolve model with precedence: node input > env GEMINI_MODEL > config > default.
+
+    Deprecated model names (e.g. gemini-3-pro-preview) are transparently
+    remapped to their current equivalents so saved workflows and old
+    configurations never cause 404 errors.
+    """
+    raw: str = ""
     if node_input and node_input.strip():
-        return node_input.strip()
+        raw = node_input.strip()
+    else:
+        env_val = os.environ.get("GEMINI_MODEL", "").strip()
+        if env_val:
+            raw = env_val
+        else:
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            config = _load_config_json(os.path.join(plugin_dir, "config.json"))
+            if config.get("model", "").strip():
+                raw = config["model"].strip()
+            else:
+                raw = "gemini-3.1-pro-preview"
 
-    env_val = os.environ.get("GEMINI_MODEL", "").strip()
-    if env_val:
-        return env_val
-
-    plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    config = _load_config_json(os.path.join(plugin_dir, "config.json"))
-    if config.get("model", "").strip():
-        return config["model"].strip()
-
-    return "gemini-3.1-pro-preview"
+    normalized = raw
+    if normalized.startswith("models/"):
+        normalized = normalized[len("models/"):]
+    return _MODEL_REMAP.get(normalized, normalized)
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -130,6 +162,98 @@ def _build_generate_content_endpoint(base_url: str, model: str) -> str:
         return f"{url}/models/{model}:generateContent"
 
     return f"{url}/v1beta/models/{model}:generateContent"
+
+
+def filter_gemini_models(models_json: list) -> list:
+    """
+    Filter a parsed models list response by supportedGenerationMethods
+    and strip the ``models/`` prefix from names.
+
+    Returns a sorted list of model display names (no prefix).
+    Never logs or returns API keys.
+    """
+    filtered: list = []
+    for m in models_json:
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" not in methods:
+            continue
+        name = m.get("name", "")
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        if name and name not in _MODEL_BLOCKLIST:
+            filtered.append(name)
+    return sorted(filtered)
+
+
+def fetch_models_list(api_key: str, base_url: str = "") -> list:
+    """
+    Synchronous fetch of Gemini models from GET /v1beta/models with
+    pagination.  Uses the ``requests`` library so it works inside
+    ComfyUI node execution (which is synchronous).
+
+    Returns the filtered, sorted list of model names.
+    Raises RuntimeError on HTTP or API errors.
+    Never logs or returns the API key.
+    """
+    import logging
+
+    _logger = logging.getLogger(__name__)
+
+    # Resolve base URL
+    if base_url and base_url.strip():
+        base = base_url.strip().rstrip("/")
+    else:
+        base = resolve_base_url("")
+    endpoint = f"{base}/v1beta/models"
+    headers = {"x-goog-api-key": api_key}
+
+    filtered: list = []
+    page_token: Optional[str] = None
+
+    while True:
+        params: Dict[str, Any] = {"pageSize": 1000}
+        if page_token:
+            params["pageToken"] = page_token
+
+        try:
+            resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
+        except requests.ConnectionError as exc:
+            raise RuntimeError(
+                f"Network error — cannot reach Gemini API at {endpoint}: {exc}"
+            ) from exc
+        except requests.Timeout as exc:
+            raise RuntimeError(
+                f"Timeout — Gemini API did not respond within 30 s: {exc}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Failed to fetch model list from Gemini API: {exc}"
+            ) from exc
+
+        if resp.status_code == 401 or resp.status_code == 403:
+            raise RuntimeError(
+                "Gemini API authentication failed (HTTP %d) — "
+                "check your API key." % resp.status_code
+            )
+        if resp.status_code != 200:
+            safe_body = _sanitize_error_text(resp.text[:1000], api_key)
+            raise RuntimeError(
+                f"Gemini API models list error {resp.status_code}: {safe_body}"
+            )
+
+        body = resp.json()
+        models: list = body.get("models", [])
+        filtered.extend(filter_gemini_models(models))
+
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            break
+
+    _logger.info(
+        "fetch_models_list: found %d models supporting generateContent",
+        len(filtered),
+    )
+    return filtered
 
 
 def call_gemini(
