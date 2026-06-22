@@ -1,11 +1,18 @@
 /**
- * ComfyUI LTX2.3 Prompt Director — Interactive Gemini Model Selector
+ * ComfyUI LTX2.3 Prompt Director — Interactive Model Selector
  *
- * Adds a "Refresh Gemini Models" button and an "available_model" combo to the
- * LTX23CinematicPromptDirectorSingle node.  The button reads the api_key from
- * the node widget, calls POST /ltx23/gemini/models, and populates the combo.
- * Selecting a model from the combo writes it back into the existing model text
- * widget so saved workflows remain compatible.
+ * Adds "Refresh Yunwu Models" button, "available_model" combo, and
+ * read-only "available_models_text" / "model_refresh_status" widgets
+ * to the LTX23CinematicPromptDirectorSingle node.
+ *
+ * The button reads the api_key from the node widget, calls
+ * POST /ltx23/gemini/models, and populates the combo.
+ * Selecting a model from the combo writes it back into the existing
+ * "model" text widget so saved workflows remain compatible.
+ *
+ * The "available_models_text" widget is a visible read-only multiline
+ * STRING that always shows the complete model list — a reliable fallback
+ * if ComfyUI combo dynamic replacement is unavailable on some versions.
  */
 
 import { app } from "../../../scripts/app.js";
@@ -16,6 +23,14 @@ import { app } from "../../../scripts/app.js";
 const DEPRECATED_MODEL_MAP = {
     "gemini-3-pro-preview": "gemini-3.1-pro-preview",
 };
+
+function normalizeModelName(value) {
+    const raw = (value || "").trim();
+    const stripped = raw.startsWith("models/")
+        ? raw.slice("models/".length)
+        : raw;
+    return DEPRECATED_MODEL_MAP[stripped] || stripped;
+}
 
 app.registerExtension({
     name: "comfyui-ltx23-prompt-director.model_selector",
@@ -33,7 +48,7 @@ app.registerExtension({
             const result = origOnNodeCreated?.apply(this, arguments);
 
             // Guard: don't double-add if already present (e.g. reload)
-            if (this.widgets.find((w) => w.name === "Refresh Gemini Models")) {
+            if (this.widgets.find((w) => w.name === "Refresh Yunwu Models")) {
                 return result;
             }
 
@@ -57,30 +72,121 @@ app.registerExtension({
 
             // ── Helper: show an error to the user reliably ────────────────
             const _showError = (msg) => {
-                console.error("[LTX23] Gemini model refresh failed:", msg);
+                console.error("[LTX23] Yunwu model refresh failed:", msg);
                 // Try ComfyUI dialog first; fall back to browser alert.
                 try {
                     if (app.ui?.dialog?.show) {
                         app.ui.dialog.show(
-                            "Gemini model refresh failed:\n" + msg
+                            "Yunwu model refresh failed:\n" + msg
                         );
                         return;
                     }
                 } catch (_e) { /* ignore */ }
-                window.alert("Gemini model refresh failed:\n" + msg);
+                window.alert("Yunwu model refresh failed:\n" + msg);
+            };
+
+            const _showInfo = (msg) => {
+                console.info("[LTX23]", msg);
+                try {
+                    if (app.ui?.dialog?.show) {
+                        app.ui.dialog.show(msg);
+                    }
+                } catch (_e) { /* ignore */ }
+            };
+
+            const _setModelValue = (value) => {
+                if (modelWidget) {
+                    modelWidget.value = value;
+                    if (typeof modelWidget.callback === "function") {
+                        modelWidget.callback(value, app.canvas, this, null, null);
+                    }
+                }
+            };
+
+            // ── Read-only status / model list text widgets ───────────────
+            // These are always visible and don't depend on ComfyUI's combo
+            // dynamic replacement being available.
+
+            // model_refresh_status: shows the last refresh result
+            const statusWidget = this.addWidget(
+                "string",
+                "model_refresh_status",
+                "Click 'Refresh Yunwu Models' to load available models.",
+                () => {},  // no-op callback (read-only)
+                { multiline: true, readonly: true }
+            );
+            // Set as read-only after creation (ComfyUI may not honour widget options)
+            if (statusWidget.inputEl) {
+                statusWidget.inputEl.readOnly = true;
+            }
+            statusWidget.serialize = false;  // runtime-only, not in saved workflow
+
+            // available_models_text: multiline read-only list of all models
+            const modelsTextWidget = this.addWidget(
+                "string",
+                "available_models_text",
+                "(not yet loaded)",
+                () => {},  // no-op callback (read-only)
+                { multiline: true, readonly: true }
+            );
+            if (modelsTextWidget.inputEl) {
+                modelsTextWidget.inputEl.readOnly = true;
+            }
+            modelsTextWidget.serialize = false;  // runtime-only, not in saved workflow
+
+            // ── Combo replacement helper (best-effort) ────────────────────
+            const _replaceModelCombo = (values, selectedValue) => {
+                const oldCombo = this.widgets.find(
+                    (w) => w.name === "available_model"
+                );
+                const oldIndex = oldCombo ? this.widgets.indexOf(oldCombo) : -1;
+                if (oldIndex >= 0) {
+                    this.widgets.splice(oldIndex, 1);
+                }
+
+                const newCombo = this.addWidget(
+                    "combo",
+                    "available_model",
+                    selectedValue,
+                    (value) => {
+                        _setModelValue(value);
+                    },
+                    {
+                        values: [...values],
+                    }
+                );
+
+                newCombo.options = newCombo.options || {};
+                newCombo.options.values = [...values];
+                newCombo.value = selectedValue;
+                newCombo.serialize = false;  // runtime-only, not in saved workflow
+
+                if (oldIndex >= 0) {
+                    const appended = this.widgets.pop();
+                    this.widgets.splice(oldIndex, 0, appended);
+                }
+
+                return newCombo;
             };
 
             // ── Refresh button ──────────────────────────────────────────
             const refreshBtn = this.addWidget(
                 "button",
-                "Refresh Gemini Models",
+                "Refresh Yunwu Models",
                 "refresh",
                 async () => {
                     const apiKey = (apiKeyWidget?.value || "").trim();
                     const baseUrl = (baseUrlWidget?.value || "").trim();
 
+                    // Update status
+                    if (statusWidget) {
+                        statusWidget.value = "Fetching models...";
+                    }
+
                     if (!apiKey) {
-                        _showError("Please enter an API key first.");
+                        const errMsg = "Please enter an API key first.";
+                        if (statusWidget) statusWidget.value = "ERROR: " + errMsg;
+                        _showError(errMsg);
                         return;
                     }
 
@@ -98,55 +204,53 @@ app.registerExtension({
 
                         if (!resp.ok || data.error) {
                             const msg = data.error || "HTTP " + resp.status;
+                            if (statusWidget) statusWidget.value = "ERROR: " + msg;
                             _showError(msg);
                             return;
                         }
 
                         if (data.models && Array.isArray(data.models)) {
-                            const comboWidget = this.widgets.find(
-                                (w) => w.name === "available_model"
-                            );
-                            if (!comboWidget) {
-                                _showError(
-                                    "Internal error: available_model combo widget not found."
-                                );
+                            const models = data.models
+                                .map((m) => normalizeModelName(m))
+                                .filter((m, idx, arr) => m && arr.indexOf(m) === idx);
+
+                            if (!models.length) {
+                                const msg = "Yunwu returned 0 usable models.";
+                                if (statusWidget) statusWidget.value = "ERROR: " + msg;
+                                _showError(msg);
                                 return;
                             }
 
-                            // Update the dropdown values
-                            comboWidget.options.values = data.models;
+                            // Always update the read-only text widgets
+                            // (these work regardless of combo support)
+                            if (modelsTextWidget) {
+                                modelsTextWidget.value = models.join("\n");
+                            }
 
                             // Determine which model to select
-                            const rawCurrentModel = (modelWidget?.value || "").trim();
-                            const strippedCurrent = rawCurrentModel.startsWith("models/")
-                                ? rawCurrentModel.slice("models/".length)
-                                : rawCurrentModel;
-                            const currentModel = DEPRECATED_MODEL_MAP[strippedCurrent] || strippedCurrent;
-                            let selectedModel =
-                                data.models.length > 0
-                                    ? data.models[0]
-                                    : "";
+                            const currentModel = normalizeModelName(modelWidget?.value);
+                            let selectedModel = models[0];
 
                             if (
                                 currentModel &&
-                                data.models.includes(currentModel)
+                                models.includes(currentModel)
                             ) {
                                 selectedModel = currentModel;
                             }
 
-                            // Set combo value (triggers its callback →
-                            // writes to modelWidget)
-                            comboWidget.value = selectedModel;
-
-                            // Belt-and-suspenders: also write to modelWidget
-                            // directly in case the value setter does not fire
-                            // the callback (e.g. when value was already equal).
-                            if (
-                                modelWidget &&
-                                modelWidget.value !== selectedModel
-                            ) {
-                                modelWidget.value = selectedModel;
+                            // Best-effort combo replacement
+                            try {
+                                _replaceModelCombo(models, selectedModel);
+                            } catch (_comboErr) {
+                                // Combo replacement failed — the text widgets
+                                // are still populated, so user can manually
+                                // type the model name into the "model" widget.
+                                console.warn(
+                                    "[LTX23] Combo replacement unavailable; " +
+                                    "use available_models_text for reference."
+                                );
                             }
+                            _setModelValue(selectedModel);
 
                             // Force the node graph to redraw so the combo
                             // dropdown reflects the new values immediately.
@@ -156,26 +260,38 @@ app.registerExtension({
                             ) {
                                 app.graph.setDirtyCanvas(true, true);
                             }
+
+                            const statusMsg =
+                                `Loaded ${models.length} model(s). ` +
+                                `Default: ${selectedModel}. ` +
+                                `See 'available_models_text' for full list.`;
+                            if (statusWidget) statusWidget.value = statusMsg;
+                            _showInfo(
+                                `Yunwu model refresh succeeded: ${models.length} models loaded.`
+                            );
+                        } else {
+                            const msg = "Invalid response: missing models array.";
+                            if (statusWidget) statusWidget.value = "ERROR: " + msg;
+                            _showError(msg);
                         }
                     } catch (err) {
-                        _showError(err.message || String(err));
+                        const msg = err.message || String(err);
+                        if (statusWidget) statusWidget.value = "ERROR: " + msg;
+                        _showError(msg);
                     }
                 }
             );
+            refreshBtn.serialize = false;  // runtime-only button, not in saved workflow
 
             // ── Model selector combo ────────────────────────────────────
             // Start with the current model value (or the default)
             const initialValues = [];
-                            const rawInitial = modelWidget?.value?.trim() || "";
-                            const strippedInitial = rawInitial.startsWith("models/")
-                                ? rawInitial.slice("models/".length)
-                                : rawInitial;
-                            const initialModel = DEPRECATED_MODEL_MAP[strippedInitial] || strippedInitial;
-                            if (initialModel) {
-                                initialValues.push(initialModel);
-                            } else {
-                                initialValues.push("gemini-3.1-pro-preview");
-                            }
+            const initialModel = normalizeModelName(modelWidget?.value);
+            if (initialModel) {
+                initialValues.push(initialModel);
+            } else {
+                initialValues.push("gemini-3.1-pro-preview");
+            }
 
             const comboWidget = this.addWidget(
                 "combo",
@@ -192,6 +308,7 @@ app.registerExtension({
                     values: initialValues,
                 }
             );
+            comboWidget.serialize = false;  // runtime-only, not in saved workflow
 
             return result;
         };

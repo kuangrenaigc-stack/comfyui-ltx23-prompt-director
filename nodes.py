@@ -2,10 +2,9 @@
 ComfyUI custom node: LTX2.3 Cinematic Prompt Director (Single Image).
 
 Converts a ComfyUI IMAGE tensor to a raw base64 PNG, sends it
-together with a scene description and duration to the official
-Gemini Developer API generateContent endpoint, and returns the
-four-field cinematic prompt JSON plus the final executable prompt
-string.
+together with a scene description and duration to the Yunwu
+Gemini-native generateContent endpoint, and returns the four-field
+cinematic prompt JSON plus the final executable prompt string.
 """
 
 from __future__ import annotations
@@ -145,7 +144,7 @@ def _tensor_to_base64(image_tensor: torch.Tensor) -> str:
 class LTX23CinematicPromptDirectorSingle:
     """
     ComfyUI node that generates LTX-2.3 cinematic prompt JSON from a single
-    reference image and scene description via the official Gemini
+    reference image and scene description via the Yunwu Gemini-native
     generateContent API.
     """
 
@@ -169,12 +168,12 @@ class LTX23CinematicPromptDirectorSingle:
             "optional": {
                 "base_url": ("STRING", {
                     "default": "",
-                    "placeholder": "Advanced: override Gemini API endpoint",
+                    "placeholder": "Advanced: override base URL (default: https://yunwu.ai)",
                     "advanced": True,
                 }),
                 "api_key": ("STRING", {
                     "default": "",
-                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
+                    "placeholder": "Yunwu API key (leave empty to use env / config.json)",
                 }),
                 "model": ("STRING", {
                     "default": "gemini-3.1-pro-preview",
@@ -225,7 +224,7 @@ class LTX23CinematicPromptDirectorSingle:
         if not resolved_api_key:
             raise ValueError(
                 "API key is required. Set it via node input, "
-                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
+                "YUNWU_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
             )
 
         # Sanitize base_url: if a corrupted non-URL value leaked in from an
@@ -316,18 +315,16 @@ class LTX23CinematicPromptDirectorSingle:
 
 
 # ---------------------------------------------------------------------------
-# Node: Gemini Official Model List
+# Node: Yunwu Model List
 # ---------------------------------------------------------------------------
 
 class GeminiOfficialModelList:
     """
-    Utility node that fetches available Gemini models from the official API.
+    Utility node that fetches available Gemini models from the Yunwu API.
 
-    Calls GET /v1beta/models with the provided API key and returns models
-    that support the generateContent method, one per line.  The "models/"
-    prefix is stripped if present.
+    Calls GET /v1beta/models with x-goog-api-key and returns model IDs, one per line.
 
-    Use this with a single Gemini API key to browse available models,
+    Use this with a single Yunwu API key to browse available models,
     then copy the desired model name into the Prompt Director node.
     """
 
@@ -338,11 +335,11 @@ class GeminiOfficialModelList:
             "optional": {
                 "api_key": ("STRING", {
                     "default": "",
-                    "placeholder": "Gemini API key (leave empty to use env / config.json)",
+                    "placeholder": "Yunwu API key (leave empty to use env / config.json)",
                 }),
                 "base_url": ("STRING", {
                     "default": "",
-                    "placeholder": "Advanced: override base URL for models list",
+                    "placeholder": "Advanced: override base URL (default: https://yunwu.ai)",
                     "advanced": True,
                 }),
             },
@@ -365,7 +362,7 @@ class GeminiOfficialModelList:
         if not resolved_api_key:
             raise ValueError(
                 "API key is required to list models. Set it via node input, "
-                "GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
+                "YUNWU_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY environment variable, or config.json."
             )
 
         # --- Resolve base URL -------------------------------------------------
@@ -380,7 +377,7 @@ class GeminiOfficialModelList:
         model_list = "\n".join(filtered)
 
         logger.info(
-            "GeminiOfficialModelList: found %d models supporting generateContent",
+            "GeminiOfficialModelList: found %d models",
             len(filtered),
         )
 
@@ -392,6 +389,7 @@ class GeminiOfficialModelList:
 # ---------------------------------------------------------------------------
 # Registers POST /ltx23/gemini/models on ComfyUI's built-in PromptServer
 # so the web JS extension can fetch models interactively.
+# Calls GET /v1beta/models with x-goog-api-key.
 # Falls back gracefully when ComfyUI is not importable (py_compile checks).
 
 _ROUTE_REGISTERED = False
@@ -427,7 +425,7 @@ try:
             )
 
         # Resolve base URL: pass through resolve_base_url for consistent
-        # precedence (node input > config.json > official default).
+        # precedence (node input > config.json > Yunwu default).
         # Strip any :generateContent suffix that may have leaked in.
         resolved_base = resolve_base_url(raw_base_url)
         if resolved_base.endswith(":generateContent"):
@@ -470,7 +468,9 @@ try:
             )
 
         _rlog.info(
-            "/ltx23/gemini/models: returned %d models", len(filtered)
+            "/ltx23/gemini/models: returned %d models: %s",
+            len(filtered),
+            ", ".join(filtered),
         )
 
         return aiohttp_web.json_response({"models": filtered})
@@ -492,5 +492,5 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX23CinematicPromptDirectorSingle": "LTX2.3 Cinematic Prompt Director (Single Image)",
-    "GeminiOfficialModelList": "Gemini Official Model List",
+    "GeminiOfficialModelList": "Yunwu Model List",
 }

@@ -1,8 +1,9 @@
 """
-Gemini official API client — calls the Gemini Developer API generateContent HTTP endpoint.
+Yunwu Gemini-native client.
 
-Uses POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
-with x-goog-api-key header.  No Google SDK / @google/genai dependency.
+Uses POST https://yunwu.ai/v1beta/models/{model}:generateContent
+with x-goog-api-key header.  Prompt construction, JSON parsing, and output
+fields stay compatible with the previous API paths.
 """
 
 from __future__ import annotations
@@ -10,17 +11,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Dict, Optional
 
 import requests
 
-# Default to the official Gemini Developer API endpoint.
-_DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
+# Default to Yunwu's Gemini-native base URL (no /v1 suffix).
+_DEFAULT_GEMINI_BASE_URL = "https://yunwu.ai"
 
 # Hard limit in seconds for a single API call so the ComfyUI node does not
 # hang indefinitely.
 _REQUEST_TIMEOUT = 120
 
+# Timeout for the models-list fetch (shorter — it's a quick metadata call).
+_MODELS_REQUEST_TIMEOUT = 30
 
 _REDACTED = "***REDACTED***"
 
@@ -63,9 +67,8 @@ def resolve_base_url(node_input: str = "") -> str:
       3. documented fallback (_DEFAULT_GEMINI_BASE_URL)
 
     There is NO dedicated base_url environment variable by design —
-    the official endpoint is always the default.  Only advanced users
-    who need a proxy or override should set base_url in config.json
-    or via the node input.
+    Yunwu is the default endpoint. Advanced users who need an override
+    should set base_url in config.json or via the node input.
     """
     if node_input and node_input.strip():
         return node_input.strip().rstrip("/")
@@ -82,15 +85,15 @@ def resolve_api_key(node_input: str = "") -> str:
     """
     Resolve api_key with this precedence:
       1. non-empty node input
-      2. env GOOGLE_API_KEY           (official docs: GOOGLE_API_KEY takes precedence)
-      3. env GEMINI_API_KEY
+      2. env YUNWU_API_KEY
+      3. env GOOGLE_API_KEY / GEMINI_API_KEY (legacy compatibility)
       4. plugin config.json (api_key key)
     Returns "" if nothing is found.
     """
     if node_input and node_input.strip():
         return node_input.strip()
 
-    for env_var in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+    for env_var in ("YUNWU_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
         env_val = os.environ.get(env_var, "").strip()
         if env_val:
             return env_val
@@ -144,40 +147,97 @@ def _parse_llm_json(raw: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
-def _build_generate_content_endpoint(base_url: str, model: str) -> str:
-    """
-    Build the Gemini generateContent endpoint robustly.
+# ---------------------------------------------------------------------------
+# Gemini-native endpoint builders
+# ---------------------------------------------------------------------------
 
-    - If base_url already ends with :generateContent, use as-is.
-    - Else strip trailing slash; if it ends with /v1beta, append
-      /models/{model}:generateContent.
-    - Else append /v1beta/models/{model}:generateContent.
+
+def _build_generate_content_endpoint(base_url: str, model: str) -> str:
+    """Build a Gemini-native :generateContent endpoint robustly.
+
+    Accepts any of these forms and normalises to the same result:
+
+        https://yunwu.ai
+        https://yunwu.ai/v1beta
+        https://yunwu.ai/v1beta/models/gemini-3.1-pro-preview:generateContent
+        https://yunwu.ai/v1beta/models/gemini-3.1-pro-preview
+
+    Returns the canonical form:
+        https://yunwu.ai/v1beta/models/{model}:generateContent
     """
     url = base_url.rstrip("/")
 
+    # If the URL already ends with :generateContent, return it as-is.
     if url.endswith(":generateContent"):
         return url
 
+    # If the URL already includes /v1beta/models/{model}, just append :generateContent.
+    import re as _re
+    if _re.search(r"/v1beta/models/[^/]+$", url):
+        return url + ":generateContent"
+
+    # If the URL ends with /v1beta, append /models/{model}:generateContent.
     if url.endswith("/v1beta"):
         return f"{url}/models/{model}:generateContent"
 
+    # Default: append the full v1beta path.
     return f"{url}/v1beta/models/{model}:generateContent"
 
+
+def _build_models_endpoint(base_url: str) -> str:
+    """Build a Gemini-native models-list endpoint robustly.
+
+    Normalises to: https://yunwu.ai/v1beta/models
+    """
+    url = base_url.rstrip("/")
+
+    # Strip :generateContent suffix if present (e.g. from a full inference URL).
+    if url.endswith(":generateContent"):
+        # Remove /{model}:generateContent → just the base
+        url = re.sub(r"/models/[^/]+:generateContent$", "", url)
+
+    if url.endswith("/v1beta/models"):
+        return url
+    if url.endswith("/v1beta"):
+        return url + "/models"
+    if url.endswith("/v1/models"):
+        # Defensive: some users might still supply an OpenAI-style URL.
+        return url.replace("/v1/models", "/v1beta/models")
+    if url.endswith("/v1"):
+        return url.replace("/v1", "/v1beta/models")
+    if url.endswith("/models"):
+        # Replace trailing /models with /v1beta/models so
+        # e.g. https://host/models → https://host/v1beta/models
+        return re.sub(r"/models$", "/v1beta/models", url)
+    return url + "/v1beta/models"
+
+
+# ---------------------------------------------------------------------------
+# Model list helpers
+# ---------------------------------------------------------------------------
 
 def filter_gemini_models(models_json: list) -> list:
     """
     Filter a parsed models list response by supportedGenerationMethods
     and strip the ``models/`` prefix from names.
 
+    When ``supportedGenerationMethods`` is present, only models that
+    include ``generateContent`` are included.  When absent (e.g. Yunwu
+    returns a flat list of names), all models pass through.
+
     Returns a sorted list of model display names (no prefix).
     Never logs or returns API keys.
     """
     filtered: list = []
     for m in models_json:
-        methods = m.get("supportedGenerationMethods", [])
-        if "generateContent" not in methods:
-            continue
-        name = m.get("name", "")
+        # Handle raw string entries (some endpoints return just names).
+        if isinstance(m, str):
+            name = m
+        else:
+            methods = m.get("supportedGenerationMethods")
+            if methods is not None and "generateContent" not in methods:
+                continue
+            name = m.get("id") or m.get("name", "")
         if name.startswith("models/"):
             name = name[len("models/"):]
         if name and name not in _MODEL_BLOCKLIST:
@@ -187,9 +247,14 @@ def filter_gemini_models(models_json: list) -> list:
 
 def fetch_models_list(api_key: str, base_url: str = "") -> list:
     """
-    Synchronous fetch of Gemini models from GET /v1beta/models with
-    pagination.  Uses the ``requests`` library so it works inside
-    ComfyUI node execution (which is synchronous).
+    Synchronous fetch of Gemini-native models from GET /v1beta/models.
+
+    Uses the ``requests`` library so it works inside ComfyUI node execution
+    (which is synchronous).
+
+    Supports both:
+      - Gemini-native response: ``{"models": [...]}``
+      - OpenAI-style response:   ``{"data": [...]}``
 
     Returns the filtered, sorted list of model names.
     Raises RuntimeError on HTTP or API errors.
@@ -204,45 +269,51 @@ def fetch_models_list(api_key: str, base_url: str = "") -> list:
         base = base_url.strip().rstrip("/")
     else:
         base = resolve_base_url("")
-    endpoint = f"{base}/v1beta/models"
+    endpoint = _build_models_endpoint(base)
+
+    # Gemini-native auth header
     headers = {"x-goog-api-key": api_key}
 
     filtered: list = []
     page_token: Optional[str] = None
 
     while True:
-        params: Dict[str, Any] = {"pageSize": 1000}
+        params: Dict[str, Any] = {}
         if page_token:
             params["pageToken"] = page_token
 
         try:
-            resp = requests.get(endpoint, headers=headers, params=params, timeout=30)
+            resp = requests.get(
+                endpoint, headers=headers, params=params,
+                timeout=_MODELS_REQUEST_TIMEOUT,
+            )
         except requests.ConnectionError as exc:
             raise RuntimeError(
-                f"Network error — cannot reach Gemini API at {endpoint}: {exc}"
+                f"Network error — cannot reach Yunwu API at {endpoint}: {exc}"
             ) from exc
         except requests.Timeout as exc:
             raise RuntimeError(
-                f"Timeout — Gemini API did not respond within 30 s: {exc}"
+                f"Timeout — Yunwu API did not respond within "
+                f"{_MODELS_REQUEST_TIMEOUT} s: {exc}"
             ) from exc
         except requests.RequestException as exc:
             raise RuntimeError(
-                f"Failed to fetch model list from Gemini API: {exc}"
+                f"Failed to fetch model list from Yunwu API: {exc}"
             ) from exc
 
-        if resp.status_code == 401 or resp.status_code == 403:
+        if resp.status_code in (401, 403):
             raise RuntimeError(
-                "Gemini API authentication failed (HTTP %d) — "
+                "Yunwu API authentication failed (HTTP %d) — "
                 "check your API key." % resp.status_code
             )
         if resp.status_code != 200:
             safe_body = _sanitize_error_text(resp.text[:1000], api_key)
             raise RuntimeError(
-                f"Gemini API models list error {resp.status_code}: {safe_body}"
+                f"Yunwu API models list error {resp.status_code}: {safe_body}"
             )
 
         body = resp.json()
-        models: list = body.get("models", [])
+        models: list = body.get("models") or body.get("data", [])
         filtered.extend(filter_gemini_models(models))
 
         page_token = body.get("nextPageToken")
@@ -250,11 +321,15 @@ def fetch_models_list(api_key: str, base_url: str = "") -> list:
             break
 
     _logger.info(
-        "fetch_models_list: found %d models supporting generateContent",
+        "fetch_models_list: found %d models",
         len(filtered),
     )
     return filtered
 
+
+# ---------------------------------------------------------------------------
+# Gemini-native generateContent call
+# ---------------------------------------------------------------------------
 
 def call_gemini(
     *,
@@ -268,7 +343,7 @@ def call_gemini(
     response_schema: Dict[str, Any],
 ) -> Dict[str, str]:
     """
-    Send a multimodal request to the official Gemini generateContent endpoint.
+    Send a multimodal request to Yunwu's Gemini-native generateContent endpoint.
 
     Returns a dict with keys:
         ltx_model_prompt       (complete_prompt_json + two newlines + final_cinematic_prompt;
@@ -282,69 +357,86 @@ def call_gemini(
     Raises GeminiClientError on failure.
     """
 
-    # Build endpoint URL
+    # Build Gemini-native endpoint URL
     endpoint = _build_generate_content_endpoint(base_url, model)
 
-    # Gemini REST uses x-goog-api-key, not Authorization Bearer
+    # Yunwu Gemini-native auth: x-goog-api-key header
     headers = {
         "x-goog-api-key": api_key,
         "Content-Type": "application/json",
     }
 
-    # Build Gemini generateContent payload
-    contents = [
+    # Build Gemini-native parts: text "首帧参考图：" + inline_data for image + user_text
+    parts: list = [
+        {"text": "首帧参考图："},
         {
-            "role": "user",
-            "parts": [
-                {"text": "首帧参考图："},
-                {
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": image_base64,
-                    }
-                },
-                {"text": user_text},
-            ],
-        }
+            "inline_data": {
+                "mime_type": "image/png",
+                "data": image_base64,
+            },
+        },
+        {"text": user_text},
     ]
 
-    payload: Dict[str, Any] = {
-        "contents": contents,
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}]
-        },
-        "generationConfig": {
-            "temperature": temperature,
-            "responseMimeType": "application/json",
-            "responseSchema": response_schema,
-        },
+    # Base generationConfig
+    generation_config: Dict[str, Any] = {
+        "temperature": temperature,
+        "responseMimeType": "application/json",
+        "responseSchema": response_schema,
     }
 
-    # Some endpoints may reject responseSchema; try once with, once without.
+    # Build the full payload
+    payload: Dict[str, Any] = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts,
+            },
+        ],
+        "systemInstruction": {
+            "parts": [
+                {"text": system_instruction},
+            ],
+        },
+        "generationConfig": generation_config,
+    }
+
+    # Some Yunwu backends may reject responseSchema with 400/415/422.
+    # Retry once without responseSchema but keep responseMimeType and the
+    # textual schema directive in system_instruction.
     raw_text: Optional[str] = None
 
     for attempt in range(2):
         if attempt == 1:
-            # Retry without responseSchema / responseMimeType to handle
-            # endpoints that don't support structured output yet.
+            # Remove responseSchema, keep responseMimeType for JSON mode.
             payload["generationConfig"].pop("responseSchema", None)
-            payload["generationConfig"].pop("responseMimeType", None)
 
-        try:
-            resp = requests.post(
-                endpoint,
-                headers=headers,
-                json=payload,
-                timeout=_REQUEST_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise GeminiClientError(
-                f"HTTP request to Gemini API failed: {exc}"
-            ) from exc
+        # Network retry: up to 2 attempts with a brief backoff for
+        # transient Yunwu inference delay / instability.
+        for net_attempt in range(2):
+            try:
+                resp = requests.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=_REQUEST_TIMEOUT,
+                )
+                break  # success — exit network retry loop
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if net_attempt == 0:
+                    time.sleep(2)  # brief backoff before one retry
+                    continue
+                raise GeminiClientError(
+                    f"HTTP request to Yunwu API failed after retry: {exc}"
+                ) from exc
+            except requests.RequestException as exc:
+                raise GeminiClientError(
+                    f"HTTP request to Yunwu API failed: {exc}"
+                ) from exc
 
         if resp.status_code == 200:
             body = resp.json()
-            # Gemini REST response: candidates[0].content.parts[*].text
+            # Gemini-native response: candidates[0].content.parts[*].text
             candidates = body.get("candidates", [])
             if not candidates:
                 raise GeminiClientError(
@@ -352,31 +444,30 @@ def call_gemini(
                     f"Response snippet: {json.dumps(body)[:500]}"
                 )
             content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
+            parts_list = content.get("parts", [])
             text_parts = [
                 p.get("text", "")
-                for p in parts
-                if "text" in p
+                for p in parts_list
+                if isinstance(p, dict)
             ]
             raw_text = "\n".join(text_parts)
             if not raw_text:
                 raise GeminiClientError(
-                    f"API returned empty text from parts. "
+                    f"API returned empty text parts. "
                     f"Response snippet: {json.dumps(body)[:500]}"
                 )
-            break  # success
+            break
 
-        # If we got a rejection specifically about structured output, retry
         if attempt == 0 and resp.status_code in (400, 415, 422):
             continue
 
-        # Any other error — raise
+        safe_body = _sanitize_error_text(resp.text[:1000], api_key)
         raise GeminiClientError(
-            f"Gemini API error {resp.status_code}: {resp.text[:1000]}"
+            f"Yunwu API error {resp.status_code}: {safe_body}"
         )
 
     if raw_text is None:
-        raise GeminiClientError("Failed to get a valid response from Gemini API")
+        raise GeminiClientError("Failed to get a valid response from Yunwu API")
 
     # Parse JSON output
     try:
